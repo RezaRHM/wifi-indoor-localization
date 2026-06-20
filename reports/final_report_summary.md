@@ -3,79 +3,74 @@
 ## Project Goal
 
 This project investigates **room-level indoor localization** using RSSI
-measurements from a 9-anchor IEEE 802.15.4 / Thread mesh network deployed
-across a 35 m × 12 m building, sampled at 28 measurement grid points. Four
-complementary approaches were evaluated using data parsed directly from
-raw `.pcapng` captures with a custom pure-Python parser: (1) **fingerprinting**
-— classifying a device's location into one of 28 grid cells from its RSSI
-vector; (2) **spatial interpolation** of RSSI via Inverse Distance
-Weighting (IDW); (3) **path-loss modelling** with shared and per-anchor
-exponents; and (4) a ten-iteration **transferability study** asking whether
-a trilateration + machine-learning correction pipeline trained with one set
-of anchors and reference points can localize using a different,
-previously-unseen set of anchors — the central practical question for
-redeploying or extending such a system.
+measurements from an 8-anchor IEEE 802.15.4 / Thread mesh network deployed
+across a 35 m × 8.1 m building, sampled at 26 measurement grid points
+grouped into 5 physical rooms. Three complementary approaches were evaluated
+using data parsed directly from raw `.pcapng` captures with a custom
+pure-Python parser: (1) **fingerprinting** — classifying a device's location
+into one of 26 grid cells from its RSSI feature vector; (2) **spatial
+interpolation** of RSSI via Inverse Distance Weighting (IDW); and
+(3) **path-loss modelling** with shared and per-anchor exponents.
 
 ## Key Results
 
-- **Fingerprinting**: Random Forest achieves **95.1% ± 4.3%** accuracy
-  across 28 rooms (grid-stratified 7-fold CV), vs. a 3.6% chance level.
-  KNN and SVM variants all reach 82.7–86.0%.
-- **RSSI interpolation (IDW)**: **4.44 dBm** overall MAE via 28-grid
-  leave-one-out CV; **5.26 dBm** on a strict 3-grid held-out test
-  (Grids 5/15/27).
-- **Path-loss modelling**: a per-anchor exponent model (Model 2, n ranging
-  1.21–3.10) reaches **5.08 dBm** MAE on held-out grids, slightly beating
-  both the shared-exponent model (5.51 dBm, n=2.2548) and IDW (5.26 dBm).
-- **Transferability baselines**: weighted-centroid trilateration (WC4,
-  Nelder-Mead) reaches **6.70 m**, beating learned baselines — RF on raw
-  RSSI (10.43 m) and SVR on engineered features (9.69 m).
-- **Best transferability result (v7)**: WC4 + Random Forest correction with
-  5-point calibration reaches **4.02 m mean error** (down from 5.16 m with
-  no calibration, a 22.1% improvement), vs. an oracle (full recalibration)
-  bound of 1.84 m.
-- **Geographic split (v8)** is far harder: 8.84 m → 7.71 m with calibration,
-  dominated by a single 32.9 m outlier at the building's far corner (Grid 14).
-- **All-anchor / rich-feature split (v9)**: 9.00 m → 7.25 m with
-  calibration, oracle bound 1.88 m; DISTANCE-related features dominate
-  (31.7% importance).
-- **Feature-complexity study (v10)**: adding 5 extra feature dimensions to
-  v7's pipeline (14 → 19) makes results **worse** with limited training
-  data (5.16 m → 6.32 m no-calib, +22.6%), demonstrating overfitting risk.
-- **Confidence scoring (v7-B)**: rejecting LOW-confidence predictions
-  improves mean error from **4.02 m to 3.62 m** (10.0% reduction, retaining
-  5/8 grids), though confidence-error correlation is only 0.01.
+- **Fingerprinting (Ch 4)**: Random Forest reaches **90.0% ± 8.2%** grid-level
+  accuracy across 26 grid cells under grid-stratified 7-fold CV — over **23×**
+  the 3.8% chance level — using a 16-dim feature vector (8 anchors × {mean, std}).
+  KNN and SVM variants reach 58.7–89.5%. At the room level (PART 2, held-out
+  one grid per room), KNN achieves **94.4%** room-level accuracy while Random
+  Forest reaches **83.3%**.
 
-## Best Method per Scenario
+- **RSSI interpolation / IDW (Ch 5)**: Leave-one-out CV over all 26 grids gives
+  **4.25 dBm** overall MAE. On a strict 2-grid held-out test (G5, G15 withheld
+  entirely from training), IDW achieves **3.87 dBm** MAE — the best RSSI
+  prediction result in this study.
 
-| Scenario | Best method | Result |
+- **Path-loss modelling (Ch 6)**: A shared path-loss exponent model
+  (Model 1, n = 2.24) reaches **5.23 dBm** MAE on held-out grids. Allowing
+  each anchor its own exponent (Model 2, n ranging 1.34–3.03) improves this to
+  **4.76 dBm**, but both parametric models remain behind IDW (3.87 dBm).
+
+## Best Method per Task
+
+| Task | Best method | Result |
 |---|---|---|
-| In-distribution room classification | Random Forest fingerprinting | 95.1% ± 4.3% accuracy |
-| RSSI prediction at arbitrary positions | IDW (power=2) | 4.44 dBm MAE (LOO-CV) |
-| RSSI prediction, held-out grids | Path-loss Model 2 (per-anchor n) | 5.08 dBm MAE |
-| Anchor transfer, interleaved split | v7: WC4 + RF + 5-pt calibration | 4.02 m mean error |
-| Anchor transfer, geographic split | v8: WC4 + RF + 3-pt calibration | 7.71 m mean error |
-| Theoretical upper bound (oracle calibration) | v7-C | 1.84 m mean error |
+| Grid-level classification (26 cells) | Random Forest fingerprinting | 90.0% ± 8.2% accuracy |
+| Room-level classification (5 rooms) | KNN-1/3/5 fingerprinting | 94.4% room accuracy |
+| RSSI prediction — all 26 grids | IDW leave-one-out CV | 4.25 dBm MAE |
+| RSSI prediction — held-out grids | IDW (G5, G15 withheld) | 3.87 dBm MAE |
+| Path-loss (shared exponent) | Model 1, n = 2.24 | 5.23 dBm MAE |
+| Path-loss (per-anchor exponent) | Model 2, n = 1.34–3.03 | 4.76 dBm MAE |
 
 ## Main Limitations
 
-- Small dataset: 28 grids, ≤9 surveyed anchors, single building/floor plan;
-  transfer test sets are only 6–9 grids, so single outliers (G14) dominate
-  headline numbers.
-- Anchor `0x0000` is surveyed but never transmits in the captures, reducing
-  every "4 TEST anchor" design to 3 usable anchors.
-- Calibration with few points (3–5 grids) can produce unstable path-loss
-  exponents (e.g. n_B=3.17 vs. n_C=2.61 in v7).
-- Geographic edge/corner extrapolation (v8, Grid 14) remains poorly handled
-  even under oracle calibration (14.06 m error).
-- The confidence score is a useful coarse reject filter but has near-zero
-  rank correlation with actual error (0.01) and was not tuned against
-  ground truth.
+- **Single building, single floor plan.** All results are specific to this
+  35 m × 8.1 m space with 8 surveyed anchors and 26 grid points. Generalization
+  to other buildings, floor plans, or anchor configurations is untested.
 
-## Main Future Direction
+- **Small dataset.** With only 26 measurement grids, per-grid statistics are
+  based on few samples, and individual grids have an outsized influence on
+  headline numbers (e.g. Grid 10, the hardest grid at 58.3% accuracy, pulls
+  down the per-grid mean significantly).
 
-Expand the dataset (more grids, anchors, and a second building/floor plan)
-to validate that v7's calibration + WC4 + RF approach generalizes, while
-re-tuning the confidence score as a regression model trained directly on
-position error — closing the gap between its current coarse reject-filter
-behavior and a fully reliable per-prediction uncertainty estimate.
+- **IDW error is still 2–5 dBm, not a position estimate.** Even the best IDW
+  result (3.87 dBm MAE) is an RSSI prediction error, not a position error.
+  Converting IDW-predicted RSSI to a 2D position requires a ranging model
+  (e.g. path-loss inversion) and trilateration, which introduces additional
+  error not yet quantified in this study.
+
+- **No deep-learning or sequence models.** All approaches use windowed mean
+  RSSI as a static feature; temporal dynamics and learned embeddings of raw
+  RSSI time-series are unexplored.
+
+## Future Direction
+
+Future work focuses on moving toward **transferable, fingerprint-free
+localization** using the foundations established in Chapters 5–6:
+
+- Invert per-anchor path-loss models (Ch 6) to estimate anchor distances,
+  then apply trilateration to produce a 2D position estimate
+- Use IDW (Ch 5) as a fallback where path-loss fits are poor
+- Validate the full pipeline across different buildings and anchor layouts
+- Apply light per-deployment calibration to adapt path-loss exponents
+  without requiring a full fingerprinting survey

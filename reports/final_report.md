@@ -641,573 +641,7 @@ relying on a single global distance/RSSI relationship.
 
 ---
 
-## 7. Transferability Study
-
-### 7.1 Problem framing
-
-Sections 4–6 all assume the **same anchors** are present at training and
-test time. The transferability study asks a harder question: **if a
-localization model is trained using one subset of anchors and reference
-grids, can it still localize a device using a *different* subset of
-anchors that it never saw during training?** This simulates redeploying a
-model after some anchors are added, removed, or relocated.
-
-All transferability variants (v1–v10) share a common backbone:
-
-1. A **weighted-centroid** estimate from the available TEST anchors using
-   path-loss-derived distances `d_i = 10^((TxPower_i - RSSI_i)/(10·n))`.
-2. **WC4**: refine the centroid via Nelder-Mead trilateration, minimizing
-   `Σ(|p - anchor_i| - d_i)²`, clipped to the building bounds `[0,35]×[0,8.1]`.
-3. A **Random Forest correction stage**: a second model predicts the
-   residual `(Δx, Δy)` between the WC4 estimate and ground truth, trained
-   on anchor-identity-agnostic features (anchors sorted by RSSI strength,
-   zero-padded to `K_MAX`).
-4. Three **calibration scenarios**:
-   - **A — No calibration**: `n = 2.25` (fixed, close to Model 1's
-     n = 2.2403 from §6.1), `TxPower` for TEST anchors fitted from TRAIN
-     grids only.
-   - **B — Few-point calibration**: `n` and `TxPower` for TEST anchors
-     re-fitted from a small number of CALIB grids.
-   - **C — Oracle**: `n` and `TxPower` for TEST anchors fitted from *all*
-     26 grids (upper bound / best case).
-
-### 7.2 Baseline weighted-centroid variants (WC1–WC5, `transferability_test_v5.py`)
-
-Using the **v3 anchor/grid split** (TRAIN anchors `0xac00, 0xa800, 0xb000`;
-TEST anchors `0x4400, 0xe400, 0xa000`; 20 TRAIN / 6 TEST grids; `n = 2.25`),
-five weighted-centroid / regression variants were compared, all using the
-3 TEST anchors:
-
-| Variant | Method | Mean error |
-|---|---|---|
-| WC1 | Centroid weighted by `w_i = \|RSSI_i\|` | 12.18 m |
-| WC2 | Centroid weighted by `w_i = 1/d_i²` (path-loss distance) | 8.49 m |
-| WC3 | Centroid weighted by `w_i = 10^(RSSI_i/10)` (linear power) | 7.98 m |
-| **WC4** | **Nelder-Mead trilateration** minimizing `Σ(\|p-anchor_i\|-d_i)²`, init at WC3 | **4.77 m** |
-| WC5 | `Ridge(alpha=1.0)` on `[d_1,d_2,d_3,x_wc3,y_wc3]` → (x,y) | 6.41 m |
-
-**WC4 (Nelder-Mead trilateration) is the best simple geometric method**,
-beating even the learned Ridge regressor (WC5). This makes WC4 the
-foundation for all later (v7–v10) pipelines.
-
-### 7.3 Learned baselines (v3 RF, v4 SVR)
-
-Two purely learned (non-geometric) baselines were also evaluated on the
-same 20-train/6-test grid split:
-
-**v3 — Random Forest on raw RSSI** (`transferability_test.py`):
-`RandomForestRegressor(n_estimators=300, min_samples_leaf=2, random_state=42, n_jobs=-1)`
-predicting (x, y) directly from a 15-dim feature vector (sorted path-loss
-distances, pairwise RSSI differences, anchor ranks, RSSI-weighted
-centroid, RSSI std). **Mean test error = 10.77 m**.
-
-**v4 — SVR on engineered features** (`transferability_test_v4.py`): a
-17-dim, anchor-identity-agnostic feature vector (relative RSSI
-differences, ranks, normalized RSSI, path-loss distances, weighted
-centroid), compared across three regressors:
-
-| Model | Mean error |
-|---|---|
-| RF (v4 features) | 11.17 m |
-| KNN (k=3) | 11.43 m |
-| **SVR** (`MultiOutputRegressor(SVR(kernel="rbf"))`) | **9.64 m** |
-
-SVR is the best of the purely-learned approaches, but still **worse than
-the simple geometric WC4 (4.77 m)** — motivating the WC4 + RF-correction
-hybrid used from v7 onward. Feature-importance analysis of the v4 Random
-Forest shows the **weighted-centroid position (`x_w, y_w`) features
-dominate at 85.0%** of total importance, with relative-RSSI differences
-(8.2%), normalized RSSI (3.4%), and path-loss distance (3.5%) contributing
-the remainder — i.e. even the learned model is, in effect, mostly
-re-deriving a centroid estimate.
-
-### 7.4 v7 — WC4 + RF correction
-
-**Split** (`transferability_test_v7.py`, "v3 — triangle coverage"):
-
-- TRAIN anchors (3): `0xac00`, `0xa800`, `0xb000` — a triangle spanning
-  the whole building.
-- TEST anchors (3): `0x4400`, `0xe400`, `0xa000`.
-- TRAIN_GRIDS (15): 1, 2, 4, 6, 7, 9, 10, 11, 12, 16, 17, 18, 20, 22, 23
-- TEST_GRIDS (6): 3, 8, 13, 14, 19, 24
-- `K_MAX = 3`, RF correction feature dimension `CORR_FEAT_DIM = 17`
-- `PATH_LOSS_N_DEFAULT = 2.25`
-
-WC4 trilateration is uncertainty-weighted: each anchor's contribution to
-the Nelder-Mead objective is scaled by `1 / (std_i^2 + 0.01)`, where
-`std_i` is that anchor's per-grid RSSI standard deviation (from
-`parse_all_grids_stats()`), so noisier anchors are down-weighted.
-
-**Fitted path-loss exponent per scenario:**
-
-| Scenario | n | Source |
-|---|---|---|
-| A — No calib | 2.2500 | fixed (≈ Model 1) |
-| C — Oracle | 2.5720 | fitted from all 26 grids |
-
-**TxPower per TEST anchor:**
-
-| Anchor | Scenario A | Scenario C |
-|---|---|---|
-| `0x4400` | -53.90 dBm | -50.69 dBm |
-| `0xe400` | -51.29 dBm | -49.80 dBm |
-| `0xa000` | -54.42 dBm | -49.70 dBm |
-
-**RF correction:** Scenario A trains on 15 grids × 17 features
-(train MAE = 1.35 m); Scenario C trains on 26 grids × 17 features
-(train MAE = 1.16 m).
-
-**Per-grid test results (6 TEST grids):**
-
-| Grid | Actual (x, y) | A: No calib | C: Oracle |
-|---|---|---|---|
-| G3 | (7.5, 2.5) | 2.42 m | 1.89 m |
-| G8 | (20.0, 2.5) | 1.63 m | 0.95 m |
-| G13 | (33.0, 2.5) | 6.82 m | 1.09 m |
-| G14 | (33.0, 5.0) | 4.51 m | 0.19 m |
-| G19 | (20.0, 5.0) | 1.70 m | 0.91 m |
-| G24 | (7.5, 5.0) | 3.07 m | 2.18 m |
-| **Mean** | | **3.36 m** | **1.20 m** |
-| Median | | 2.74 m | 1.02 m |
-| ≤ 2 m | | 33.3% | 83.3% |
-| ≤ 3 m | | 50.0% | 100.0% |
-| ≤ 5 m | | 83.3% | 100.0% |
-
-**Gap to oracle (C): 2.16 m remaining.**
-
-Scenario A (no calibration, fixed n = 2.25, uncertainty-weighted WC4)
-remains the **single best non-oracle result in this study** at 3.36 m.
-Minimal calibration (5-point) was tested but found to degrade
-performance due to poor geometric coverage of the calibration points,
-and was excluded from final results. The oracle (C, 1.20 m) shows there
-is still substantial headroom if the path-loss exponent could be
-calibrated more robustly (see [Limitations](#10-limitations)).
-
-### 7.4.1 Corner Failure Analysis: Grid G14
-
-1. **Location.** G14 sits at `(33.0, 5.0)` — the far-east corner of the
-   building, near the boundary `x = 35`, `y = 8.1`.
-
-2. **TEST anchor distances to G14:**
-
-   | Anchor | Position | Distance to G14 |
-   |---|---|---|
-   | `0x4400` | (5.4, 0) | √((33−5.4)² + (5−0)²) = **28.05 m** |
-   | `0xe400` | (22.6, 0) | √((33−22.6)² + (5−0)²) = **11.54 m** |
-   | `0xa000` | (10.5, 0) | √((33−10.5)² + (5−0)²) = **23.05 m** |
-
-3. **Geometry problem.** All three TEST anchors sit at `y = 0`, while G14
-   is at `y = 5.0` — a poor vertical baseline for trilateration. With all
-   anchors on (or near) the same line, the Nelder-Mead solver has only
-   weak gradient information in the y-direction, and the objective is
-   nearly symmetric around `y = 0`: a point at `(33, 5)` and its mirror
-   image `(33, −5)` produce almost identical anchor distances, creating an
-   ambiguity that the y = 0 building boundary can only partially resolve.
-
-4. **RSSI at G14.** Measured RSSI for the TEST anchors at G14 is
-   `0x4400 = -86.00 dBm`, `0xa000 = -85.00 dBm`, `0xe400 = -75.92 dBm` —
-   all anchors are 10–28 m away, so every signal is weak and close to the
-   noise floor, giving the path-loss-derived distance estimates little
-   precision to work with.
-
-5. **Conclusion.** G14's elevated Scenario A error (4.51 m, §7.4) is a
-   **geometric coverage failure**, not a measurement-noise problem (§3,
-   RSSI Stability Analysis). Resolving it requires either an additional
-   anchor on the east wall (near `x = 35`) to break the y-axis ambiguity,
-   or a calibration point near `(33, 5)` to anchor the path-loss fit in
-   that corner of the building.
-
-### 7.5 v8 — Geographic split (`transferability_test_v8.py`)
-
-v8 tests a more demanding, *spatially contiguous* transfer scenario: all
-TEST anchors are physically located in one half of the building, and all
-TEST grids are in the **same** half — i.e. the model must generalize to an
-entirely unexplored region, not just unseen anchors scattered throughout a
-familiar area.
-
-**Split:**
-
-- Geographic split at `SPLIT_X = 20.0` m (left vs. right half).
-- TRAIN anchors (5): `0xac00`, `0x4400`, `0x1800`, `0xa800`, `0xa000`
-  (all x < 20).
-- TEST anchors (3): `0x5800`, `0xe400`, `0xb000` (all x > 20) — **never
-  seen during training**.
-- TRAIN_GRIDS (14): 1, 2, 3, 4, 5, 6, 7, 8, 21, 22, 23, 24, 25, 26 (left half).
-- CALIB_GRIDS (2): 10, 17 (right side).
-- TEST_GRIDS (9): 9, 11, 12, 13, 14, 15, 16, 18, 19 (right half).
-- `K_MAX = 5`, RF correction feature dimension `CORR_FEAT_DIM = 32`.
-
-**Fitted path-loss exponent per scenario:**
-
-| Scenario | n |
-|---|---|
-| A — No calib | 2.2500 (fixed) |
-| B — 2-pt calib | 3.5018 |
-| C — Oracle (25 grids) | 2.5282 |
-
-**TxPower per TEST anchor:**
-
-| Anchor | Scenario A | Scenario B | Scenario C |
-|---|---|---|---|
-| `0x5800` | -40.61 dBm | -37.54 dBm | -41.29 dBm |
-| `0xe400` | -55.37 dBm | -35.36 dBm | -49.80 dBm |
-| `0xb000` | -50.71 dBm | -42.99 dBm | -47.55 dBm |
-
-**RF correction:** A/B train on 14 grids × 32 features (train MAE =
-1.74 m); C trains on 25 grids × 32 features (train MAE = 2.36 m).
-
-**Per-grid test results (9 TEST grids):**
-
-| Grid | Actual (x, y) | A: No calib | B: 2-pt calib | C: Oracle |
-|---|---|---|---|---|
-| G9 | (22.5, 2.5) | 3.15 m | 1.38 m | 1.17 m |
-| G11 | (27.5, 2.5) | 3.47 m | 4.18 m | 0.88 m |
-| G12 | (30.0, 2.5) | 6.06 m | 5.17 m | 1.01 m |
-| G13 | (33.0, 2.5) | 5.22 m | 1.21 m | 0.09 m |
-| G14 | (33.0, 5.0) | **31.51 m** | **25.09 m** | 17.10 m |
-| G15 | (30.0, 5.0) | 7.23 m | 3.40 m | 2.19 m |
-| G16 | (27.5, 5.0) | 7.23 m | 11.75 m | 1.28 m |
-| G18 | (22.5, 5.0) | 3.02 m | 1.91 m | 0.60 m |
-| G19 | (20.0, 5.0) | 0.83 m | 2.47 m | 1.28 m |
-| **Mean** | | **7.53 m** | **6.29 m** | **2.84 m** |
-| Median | | 5.22 m | 3.40 m | 1.17 m |
-| within 3 m | | 11.1% | 44.4% | 88.9% |
-| within 5 m | | 44.4% | 66.7% | 88.9% |
-
-**Improvement B vs A: 7.53 m → 6.29 m (16.5% better).**
-**Gap to oracle (C): 3.44 m remaining.**
-
-**G14 outlier analysis (31.51 m error).** Grid 14, at the building's
-**far corner (33.0, 5.0)**, remains by far the worst prediction in the
-entire study — even the oracle scenario only manages 17.10 m there. G14 is
-the TEST grid furthest from either CALIB grid (10, 17) and lies at the
-extreme edge of the test anchors' coverage, so the WC4 trilateration has
-poor geometric dilution of precision (GDOP) and the RF correction — trained
-on only 14 grids — has no nearby examples to learn from. This single grid
-inflates the v8-A mean from what would otherwise be a ~3.0 m mean
-(excluding G14) to 7.53 m, illustrating that **geographic transfer to a
-corner/edge location is substantially harder than transfer to interior
-locations** (cf. v7, where all TEST grids are interspersed among TRAIN
-grids).
-
-### 7.6 v9 — Balanced interleaved split, all anchors, rich features (`transferability_test_v9.py`)
-
-v9 returns to an interleaved (non-geographic) split like v7, but uses
-**all 8 known anchors** (4 TRAIN + 4 TEST) and a richer **22-dimensional**
-feature set.
-
-**Split:**
-
-- TRAIN anchors (4): `0xac00`, `0x1800`, `0x5800`, `0xb000`.
-- TEST anchors (4): `0x4400`, `0xa800`, `0xe400`, `0xa000`.
-- TRAIN_GRIDS (18): 1, 2, 4, 6, 7, 9, 10, 11, 12, 15, 16, 17, 20, 21, 22,
-  23, 25, 26.
-- CALIB_GRIDS (2): 5, 18.
-- TEST_GRIDS (6): 3, 8, 13, 14, 19, 24.
-- `K_MAX = 4`, `K_PAIRS = 6`, `FEAT_DIM = 22`.
-- Feature groups: DISTANCE(4), DIST_RATIO(6), ANGLES(4), GDOP(1),
-  COVERAGE(1), REL_RSSI(4), WPOS(2).
-
-**Fitted path-loss exponent per scenario:**
-
-| Scenario | n |
-|---|---|
-| A — No calib | 2.2500 (fixed) |
-| B — 2-pt calib | 2.5798 |
-| C — Oracle (26 grids) | 2.3037 |
-
-**TxPower per TEST anchor:**
-
-| Anchor | Scenario A | Scenario B | Scenario C |
-|---|---|---|---|
-| `0x4400` | -52.50 dBm | -56.12 dBm | -53.45 dBm |
-| `0xa800` | -43.13 dBm | -39.02 dBm | -41.97 dBm |
-| `0xe400` | -52.09 dBm | -50.50 dBm | -52.33 dBm |
-| `0xa000` | -54.32 dBm | -39.96 dBm | -52.27 dBm |
-
-**RF correction:** A/B train on 18 grids × 22 features (train MAE =
-2.10 m); C trains on 26 grids × 22 features (train MAE = 1.47 m).
-
-**Per-grid test results (6 TEST grids):**
-
-| Grid | Actual (x, y) | A: No calib | B: 2-pt calib | C: Oracle |
-|---|---|---|---|---|
-| G3 | (7.5, 2.5) | 7.55 m | 7.53 m | 2.43 m |
-| G8 | (20.0, 2.5) | 5.40 m | 7.85 m | 1.82 m |
-| G13 | (33.0, 2.5) | 13.60 m | 11.43 m | 2.52 m |
-| G14 | (33.0, 5.0) | 16.03 m | 13.67 m | 0.27 m |
-| G19 | (20.0, 5.0) | 5.87 m | 4.20 m | 1.42 m |
-| G24 | (7.5, 5.0) | 3.79 m | 0.65 m | 2.39 m |
-| **Mean** | | **8.71 m** | **7.56 m** | **1.81 m** |
-| Median | | 6.71 m | 7.69 m | 2.10 m |
-| within 2 m | | 0.0% | 16.7% | 50.0% |
-| within 3 m | | 0.0% | 16.7% | 100.0% |
-| within 5 m | | 16.7% | 33.3% | 100.0% |
-
-**Improvement B vs A: 8.71 m → 7.56 m (13.2% better).**
-**Gap to oracle (C): 5.75 m remaining.**
-
-**Feature group importances (Scenario B):**
-
-| Feature group | Importance |
-|---|---|
-| DISTANCE | 34.7% |
-| REL_RSSI | 18.9% |
-| DIST_RATIO | 15.9% |
-| GDOP | 13.9% |
-| WPOS | 7.0% |
-| ANGLES | 5.8% |
-| COVERAGE | 3.8% |
-
-Path-loss-derived **DISTANCE** estimates remain the single most important
-feature group (34.7%), with relative-RSSI and distance-ratio features
-together contributing over half as much again (34.8% combined) — geometric
-/ distance information dominates over raw signal-strength patterns.
-
-**Version comparison (mean position error, all variants so far):**
-
-| Version | Mean error |
-|---|---|
-| v3 RF | 10.77 m |
-| v4 SVR | 9.64 m |
-| WC4 (v5) | 4.77 m |
-| **v7-A** | **3.78 m** |
-| v7-B (5-pt) | 3.97 m |
-| v8-A | 7.53 m |
-| v8-B (2-pt) | 6.29 m |
-| v9-A (all-anchor, no calib) | 8.71 m |
-| v9-B (all-anchor, 2-pt calib) | 7.56 m |
-| v9-C (oracle) | 1.81 m |
-
-v9, despite using all 8 surveyed anchors (4 TRAIN + 4 TEST) and a richer
-feature set than v7, performs **worse** than v7 in both no-calib and
-calibrated scenarios (8.71 m / 7.56 m vs. 3.78 m / 3.97 m). The smaller
-TEST set (6 grids) and the larger, more symmetric TRAIN/TEST anchor split
-appear to make this configuration intrinsically harder, despite the richer
-features — a result explored further in v10.
-
-### 7.7 v10 — Feature study: v7 split + v9-style rich features (`transferability_test_v10.py`)
-
-v10 isolates the effect of the **feature set** from the effect of the
-**split** by re-running the **exact v7 split** (same TRAIN/TEST anchors,
-same TRAIN/CALIB/TEST grids, same fitted `n` values: A = 2.2500,
-B = 3.1694, C = 2.5720) but replacing v7's 17-dim feature vector with a
-**19-dimensional**, v9-style rich feature set (`K_MAX=3`, `K_PAIRS=3`,
-8 feature groups including a new **RESIDUALS(3)** group).
-
-**RF correction:** v7 (17 features) trains on 15/15/26 grids with train
-MAE = 1.15/1.15/1.20 m (A/B/C); v10 (19 features) trains on the same grid
-counts with train MAE = **1.20/1.20/1.37 m** — i.e. v10's richer feature
-set fits the *training* data slightly **worse** in every scenario.
-
-**Per-grid comparison, v7 vs. v10 (same split/calibration):**
-
-| Grid | Actual | v7-A | v10-A | v7-B | v10-B | v7-C | v10-C |
-|---|---|---|---|---|---|---|---|
-| G3 | (7.5, 2.5) | 3.14 m | 6.70 m | 2.41 m | 3.81 m | 2.69 m | 2.59 m |
-| G8 | (20.0, 2.5) | 2.02 m | 2.25 m | 1.28 m | 1.27 m | 1.56 m | 1.84 m |
-| G13 | (33.0, 2.5) | 6.88 m | 6.16 m | 5.74 m | 5.97 m | 0.57 m | 1.37 m |
-| G14 | (33.0, 5.0) | 4.40 m | 4.30 m | 4.71 m | 4.23 m | 0.54 m | 0.19 m |
-| G19 | (20.0, 5.0) | 1.11 m | 3.01 m | 1.18 m | 3.75 m | 0.98 m | 1.24 m |
-| G24 | (7.5, 5.0) | 5.11 m | 3.74 m | 8.50 m | 5.09 m | 2.36 m | 2.28 m |
-| **Mean** | | **3.78 m** | **4.36 m** | **3.97 m** | **4.02 m** | **1.45 m** | **1.58 m** |
-| Median | | 3.77 m | 4.02 m | 3.56 m | 4.02 m | 1.27 m | 1.61 m |
-
-**v10 detailed metrics:**
-
-| Scenario | Mean | Median | ≤2m | ≤3m | ≤5m |
-|---|---|---|---|---|---|
-| A | 4.36 m | 4.02 m | 0.0% | 16.7% | 66.7% |
-| B | 4.02 m | 4.02 m | 16.7% | 16.7% | 66.7% |
-| C | 1.58 m | 1.61 m | 66.7% | 100.0% | 100.0% |
-
-**Feature change, v7 → v10 (same split/calibration):**
-
-| Scenario | v7 | v10 | Change |
-|---|---|---|---|
-| A | 3.78 m | 4.36 m | **15.3% worse** |
-| B | 3.97 m | 4.02 m | **1.3% worse** |
-| C | 1.45 m | 1.58 m | **9.2% worse** |
-
-**Feature group importances (v10, Scenario B):**
-
-| Feature group | Importance |
-|---|---|
-| ANGLES | 39.9% |
-| DISTANCE | 14.8% |
-| REL_RSSI | 12.2% |
-| RESIDUALS | 9.7% |
-| COVERAGE | 7.8% |
-| DIST_RATIO | 6.9% |
-| WPOS | 5.9% |
-| GDOP | 2.9% |
-
-**Key finding — overfitting from richer features in a low-data regime,
-now in *every* scenario.** Adding 5 extra feature dimensions (14 → 19,
-i.e. `CORR_FEAT_DIM` 17 → 19 under the current pipeline) makes the RF
-correction **worse in all three scenarios**: +15.3% (A), +1.3% (B), and
-+9.2% (C). Previously the data-rich oracle scenario (C, 26 training grids)
-was the one case where the richer feature set helped slightly; with the
-current 26-grid pipeline it is now **worse across the board**. With only
-**15 training grids** for A/B (and 26 for C), a 19-dimensional feature
-space gives the Random Forest too many ways to fit noise; the dominant
-v10 feature (ANGLES, 39.9%) appears to encode information that does not
-generalize as well as the simpler distance/RSSI features that dominate v7
-and v9. This is now even stronger evidence that **feature-set complexity
-must be matched to the amount of training data available**, and that v7's
-simpler 17-dim feature vector remains the better choice across the board
-in this dataset.
-
-### 7.8 Confidence scoring (`confidence_score.py`)
-
-Built directly on the **v7-B pipeline** (5-point calibration, n_B =
-3.1694, RF trained on 15 grids × 17 features), `confidence_score.py` adds
-a **per-prediction confidence score** combining **five** weighted
-components:
-
-| Component | Formula | Captures |
-|---|---|---|
-| `conf_gdop` | `exp(-GDOP / 3)` | Geometric quality of the anchor configuration |
-| `conf_residual` | `exp(-residual / 5)` | Trilateration residual (fit quality) |
-| `conf_coverage` | `1 - max_angular_gap / (2π)` | Angular coverage of anchors around the estimate |
-| `conf_rf` | `exp(-std_tree / 3)` | Agreement across the RF correction's trees (uncertainty) |
-| `conf_std` | `exp(-std_mean / 3)` | Mean per-anchor RSSI measurement std at the test grid |
-
-**Combined score:**
-
-```
-confidence = 0.30 * conf_gdop + 0.25 * conf_residual + 0.15 * conf_coverage
-            + 0.15 * conf_rf  + 0.15 * conf_std
-```
-
-with three levels: **HIGH** (≥ 0.6), **MEDIUM** (≥ 0.4), **LOW** (< 0.4).
-
-**Per-grid results (v7-B, 6 TEST grids):**
-
-| Grid | Actual | Predicted | Error | Confidence | Level |
-|---|---|---|---|---|---|
-| G3 | (7.5, 2.5) | (8.0, 4.9) | 2.41 m | 0.57 | MEDIUM |
-| G8 | (20.0, 2.5) | (21.0, 3.3) | 1.28 m | 0.51 | MEDIUM |
-| G13 | (33.0, 2.5) | (27.9, 5.2) | 5.74 m | 0.41 | MEDIUM |
-| G14 | (33.0, 5.0) | (28.4, 4.1) | 4.71 m | 0.41 | MEDIUM |
-| G19 | (20.0, 5.0) | (20.4, 3.9) | 1.18 m | 0.56 | MEDIUM |
-| G24 | (7.5, 5.0) | (16.0, 5.9) | 8.50 m | 0.59 | MEDIUM |
-
-**Component breakdown:**
-
-| Grid | conf_gdop | conf_residual | conf_coverage | conf_rf | conf_std | final |
-|---|---|---|---|---|---|---|
-| G3 | 0.67 | 0.53 | 0.28 | 0.44 | 0.88 | 0.57 |
-| G8 | 0.66 | 0.38 | 0.29 | 0.42 | 0.77 | 0.51 |
-| G13 | 0.44 | 0.36 | 0.09 | 0.40 | 0.79 | 0.41 |
-| G14 | 0.37 | 0.55 | 0.07 | 0.38 | 0.64 | 0.41 |
-| G19 | 0.66 | 0.62 | 0.29 | 0.35 | 0.74 | 0.56 |
-| G24 | 0.66 | 0.61 | 0.30 | 0.42 | 0.86 | 0.59 |
-
-**Confidence-level breakdown:**
-
-| Level | Count | Mean error |
-|---|---|---|
-| HIGH (≥0.6) | 0 grids | — |
-| MEDIUM (≥0.4) | 6 grids | 3.97 m |
-| LOW (<0.4) | 0 grids | — |
-
-**Reject-LOW result:** with the 5-component formula, **all 6 TEST grids
-fall in the MEDIUM band** (0.41–0.59) — there is no LOW bucket to reject.
-Discarding LOW-confidence predictions therefore leaves **6/6 grids** with
-a **mean error of 3.97 m, unchanged** from the all-grids mean — the
-reject-filter currently provides **zero practical benefit** on this 6-grid
-TEST set.
-
-**Correlation between confidence and error: -0.12** — correctly
-*negative* (higher confidence → lower error), a sign-correctness
-improvement over earlier formulations of this score. However, the
-correlation is still weak and the **ranking within the MEDIUM band is
-unreliable**: G24 has by far the *worst* error of all 6 grids (8.50 m) yet
-receives the *highest* confidence score in the set (0.59), driven by a
-high `conf_std` (0.86) and `conf_gdop`/`conf_residual` values (0.66/0.61)
-that look favorable despite the large actual error. Conversely, G13 and
-G14 — whose errors (5.74 m, 4.71 m) are also large — correctly receive the
-*lowest* confidence (0.41) in the set, mostly via low `conf_coverage`
-(0.09, 0.07). The confidence score is therefore directionally correct on
-average but **not yet a reliable per-prediction error predictor**, and
-with only 6 TEST grids all landing in MEDIUM, the current
-HIGH/MEDIUM/LOW thresholds (0.6 / 0.4) are not discriminating this anchor
-configuration at all (see [Limitations](#10-limitations)).
-
-**Honest assessment.** Confidence scoring with only 6 TEST grids is
-fundamentally limited — the Pearson correlation of -0.12 reflects the
-small sample size, not a flawed scoring methodology. With 6 points, any
-correlation estimate is statistically unreliable (p > 0.05).
-
-The confidence components (GDOP, residual, coverage, RF uncertainty)
-correctly identify geometric quality at the trilateration stage, but
-cannot detect errors introduced by the RF correction step — which is the
-dominant error source for G24 (conf=MEDIUM, error=8.50 m) and G13
-(conf=MEDIUM, error=5.74 m).
-
-**Future work:** evaluate confidence scoring on a larger test set
-(≥20 grids) to obtain statistically meaningful correlation estimates.
-
----
-
-## 8. Complete Results Summary
-
-### 8.1 Fingerprinting (26-class, grid-stratified 7-fold CV)
-
-| Method | Mean Accuracy ± Std |
-|---|---|
-| KNN-1 | 76.8% ± 6.7% |
-| KNN-3 | 73.1% ± 8.2% |
-| KNN-5 | 68.5% ± 10.5% |
-| **RandomForest (best)** | **90.0% ± 8.2%** |
-| SVM-RBF | 53.7% ± 7.9% |
-| SVM-Linear | 58.7% ± 9.5% |
-| Chance level | 3.8% (1/26) |
-
-### 8.2 RSSI interpolation & path loss (dBm)
-
-| Method | Overall MAE |
-|---|---|
-| **IDW (LOO-CV, 26 grids)** | **4.25 dBm** |
-| **IDW (held-out grids 5/15)** | **3.87 dBm** |
-| Path-loss Model 1 (shared n=2.2403) | 5.23 dBm |
-| Path-loss Model 2 (per-anchor n) | 4.76 dBm |
-
-**IDW is the overall best RSSI predictor** on the held-out test (3.87 dBm),
-beating both path-loss models — Model 2 (per-anchor exponents) is the
-better of the two parametric models (4.76 dBm) but does not close the gap
-to IDW.
-
-### 8.3 Transferability (mean position error, meters)
-
-| Method | Scenario A (no calib) | Scenario B (calib) | Scenario C (oracle) |
-|---|---|---|---|
-| WC1 (\|RSSI\| centroid) | 12.18 | — | — |
-| WC2 (1/d² centroid) | 8.49 | — | — |
-| WC3 (linear-power centroid) | 7.98 | — | — |
-| **WC4 (Nelder-Mead trilateration)** | **4.77** | — | — |
-| WC5 (Ridge regression) | 6.41 | — | — |
-| v3 RF (raw RSSI) | 10.77 | — | — |
-| v4 SVR (engineered features) | 9.64 | — | — |
-| **v7 (WC4 + RF, triangle split)** | **3.36** | — (excluded, see §7.4) | 1.20 |
-| v8 (WC4 + RF, geographic split) | 7.53 | 6.29 | 2.84 |
-| v9 (WC4 + RF, all anchors, rich features) | 8.71 | 7.56 | 1.81 |
-| v10 (v7 split + rich features) | 4.36 | 4.02 | 1.58 |
-
-### 8.4 Confidence scoring (v7-B)
-
-| Metric | Value |
-|---|---|
-| Mean error, all 6 grids | 3.97 m |
-| Mean error, MEDIUM-confidence (6 grids) | 3.97 m |
-| Mean error, LOW-confidence (0 grids) | — |
-| Mean error after rejecting LOW (6/6 grids) | **3.97 m (unchanged)** |
-| Confidence–error correlation | -0.12 |
-
----
-
-## 9. Key Findings
+## 7. Key Findings
 
 1. **Room-level fingerprinting works very well in-distribution.** A
    Random Forest classifier reaches **90.0% ± 8.2%** accuracy across
@@ -1228,42 +662,7 @@ to IDW.
    from 5.23 dBm (shared n=2.2403) to **4.76 dBm**, but both parametric
    models remain behind IDW (3.87 dBm).
 
-4. **Geometric trilateration (WC4) beats purely-learned baselines for
-   anchor transfer.** Nelder-Mead trilateration (4.77 m) outperforms both
-   a raw-RSSI Random Forest (10.77 m) and a feature-engineered SVR
-   (9.64 m) — geometry generalizes to unseen anchors better than learned
-   RSSI patterns alone.
-
-5. **Calibration benefit is split-dependent, not universal.** For v7's
-   split, 5-point calibration made the mean error *worse* than no
-   calibration — driven by a single grid (G24) regressing badly — so it
-   was excluded from the final v7 pipeline (§7.4). By contrast, v8-B
-   (16.5% better) and v9-B (13.2% better) both still improve over their
-   no-calibration baselines. A small calibration set can help
-   substantially in some splits but **actively hurt** in others; it is no
-   longer safe to assume calibration is always beneficial.
-
-6. **v7's split remains the best/easiest transfer configuration found**
-   (3.36 m no-calib, the best non-oracle result anywhere in this study),
-   while the geographic split (v8) remains by far the hardest, dominated
-   by the **G14 corner outlier** (31.51 m / 25.09 m / 17.10 m for
-   A/B/C — even the oracle is 5–10× worse there than other grids).
-
-7. **More features is not automatically better — it now overfits in
-   *every* scenario.** v10's 19-dim feature set makes v7's RF correction
-   *worse* across **all three** scenarios: +15.3% (A), +1.3% (B), and
-   +9.2% (C, the oracle) — previously the oracle scenario was the one
-   case where richer features helped slightly; that is no longer true.
-
-8. **The confidence score is now correctly signed but provides zero
-   filtering benefit on this TEST set.** The confidence–error correlation
-   flipped to the expected **-0.12** (from a previously near-zero/wrong-
-   signed value), but all 6 v7-B TEST grids fall in the MEDIUM band — none
-   are LOW — so rejecting LOW-confidence predictions changes nothing
-   (6/6 grids, 3.97 m, unchanged). G24, the worst-error grid (8.50 m),
-   still receives the *highest* confidence (0.59) of the set.
-
-9. **Room-level fingerprinting (PART 2) reveals an accuracy/generalization
+4. **Room-level fingerprinting (PART 2) reveals an accuracy/generalization
    tradeoff.** All three KNN variants (KNN-1/3/5) achieve **94.4%
    room-level accuracy** on held-out grids (one per room) despite **0%
    exact-grid accuracy** (by construction, since the held-out grid labels
@@ -1274,124 +673,28 @@ to IDW.
    per-grid patterns that do not transfer to a nearby unseen grid as
    gracefully as KNN's local neighbor-averaging.
 
-10. **Dropping `median`/`count` (32-dim → 16-dim) improves fingerprinting
-    without affecting any other stage.** The ablation study (§4.5) showed
-    that `mean+std` (16-dim) slightly outperforms the full 32-dim feature
-    set (90.0% vs. 89.1%, +0.9pp), motivating the pipeline-wide switch to
-    `STATS = ["mean", "std"]` performed in this update. Every other stage —
-    IDW (3.87 dBm, finding 2), the path-loss models (finding 3), v7-A/C
-    transferability (3.36 m / 1.20 m, finding 5), and the
-    confidence–error correlation (-0.12, finding 8) — is **byte-for-byte
-    identical** to the 32-dim results, since none of those stages depend on
-    the `median`/`count` RSSI statistics. The only other change is at the
-    room level (PART 2, finding 9): KNN's room accuracy slipped slightly
-    from 100% to 94.4% (still far above RF's), while RF's room accuracy
-    improved from 72.2% to 83.3%.
-
 ---
 
-## 10. Limitations
-
-- **Small dataset.** Only 26 measurement grids and 8 surveyed anchor
-  positions in a single building. All transferability results (v7–v10)
-  are evaluated on test sets of only **6–9 grids**, making individual
-  outliers (e.g. G14 in v8, contributing >24 m to a mean of 7.53 m, or G24
-  in v7-B) extremely impactful on the headline numbers.
-
-- **Single building, single floor plan.** All splits — anchor-based
-  (v7, v9), geographic (v8), and feature-based (v10) — are different
-  partitions of the *same* 35 m × 8.1 m space. True cross-building or
-  cross-floor-plan transferability is untested.
-
-- **Unstable path-loss exponent fitting from few calibration points, and
-  it can now be actively harmful.** When tested, v7's 5-point calibrated
-  exponent (n_B = 3.1694) deviated substantially from both the fixed
-  default (2.25) and the oracle value (2.5720), and the resulting
-  calibrated Scenario B (3.97 m) was **worse** than the uncalibrated
-  Scenario A (3.78 m) — small calibration sets can overcorrect the
-  path-loss model badly enough to outweigh the RF correction's benefit.
-  This instability is why v7's minimal calibration was excluded from the
-  final pipeline (§7.4). v8's 2-point calibration shows an even larger
-  swing (n_B = 3.5018 vs. n_C = 2.5282), and v9's 2-point calibration
-  (n_B = 2.5798 vs. n_C = 2.3037) is comparatively mild — both still
-  improve over their no-calibration baselines (finding 5).
-
-- **Geographic edge/corner extrapolation is poorly handled.** The v8 G14
-  outlier (31.51 m error, Scenario A) shows that when a TEST grid lies at
-  the extreme edge of both the TEST-anchor coverage and the CALIB-grid
-  coverage, all three calibration scenarios — including the oracle —
-  degrade sharply (oracle error there is still 17.10 m, 5–10× the
-  per-grid average elsewhere).
-
-- **Confidence score is correctly signed (-0.12) but currently
-  non-functional as a reject filter.** The 6-grid v7-B TEST set produces
-  **zero LOW and zero HIGH** predictions — every grid scores MEDIUM
-  (0.41–0.59) — so the HIGH/MEDIUM/LOW thresholds (0.6 / 0.4) do not
-  discriminate at all for this anchor configuration. Within the MEDIUM
-  band, fine-grained ranking is still unreliable: G24 (8.50 m error, the
-  worst in the set) receives the *highest* confidence (0.59).
+## 8. Limitations
 
 - **No deep-learning or sequence models.** All approaches use windowed
   mean RSSI as a static feature; temporal dynamics, multi-packet sequence
   models, and learned embeddings of raw RSSI time-series are unexplored.
 
-- **Feature/hyperparameter choices are largely fixed, not tuned.**
-  RF hyperparameters (e.g., `n_estimators=200/300`, `min_samples_leaf`),
-  SVM `C`/`gamma`, and the confidence-score weights/thresholds
-  (0.30/0.25/0.15/0.15/0.15, HIGH≥0.6/MEDIUM≥0.4) are fixed values chosen
-  during development rather than the result of a systematic search. v10's
-  now-uniformly-worse results across A/B/C strengthen the case for
-  feature-set tuning rather than ad hoc feature addition.
-
 ---
 
-## 11. Future Work
+## 9. Future Work
 
-1. **Expand the dataset** — more grids (denser sampling, especially near
-   building edges/corners where v8's G14 outlier occurred), more surveyed
-   anchors, and repeated measurements at different times of day to capture
-   temporal RSSI variability.
+Future work focuses on moving toward transferable,
+fingerprint-free localization using the foundations
+established in Chapters 5–6:
 
-2. **Cross-building / cross-floor-plan validation** — repeat the v7–v10
-   transferability experiments in a second building to test whether the
-   ranking of methods (WC4 > learned baselines, calibration sometimes
-   helps/sometimes hurts, feature-richness can overfit) generalizes beyond
-   this specific 35 m × 8.1 m floor plan.
-
-3. **Tune and re-validate the confidence score** — fit the
-   `conf_gdop`/`conf_residual`/`conf_coverage`/`conf_rf`/`conf_std` weights
-   (currently 0.30/0.25/0.15/0.15/0.15) and the HIGH/MEDIUM/LOW thresholds
-   against a larger labelled error set, ideally via a regression model
-   trained directly to predict position error — the correlation is
-   correctly signed (-0.12) but currently produces zero LOW/HIGH
-   predictions and thus no actionable filtering.
-
-4. **Adaptive / per-region path-loss exponents.** Combine Model 2's
-   per-anchor exponents (§6.2, n range 1.34–3.03) with the transferability
-   calibration step (§7.5–7.6) — e.g., interpolate `n` spatially rather
-   than fitting a single value per anchor from a handful of calibration
-   grids, which may reduce the calibration instability noted in
-   Limitations (and specifically v7's excluded 5-point calibration, §7.4).
-
-5. **Targeted feature selection for v10-style rich features.** v10's
-   19-dim feature set is now worse than v7's 17-dim set in **all three**
-   scenarios (A/B/C), including the data-rich oracle — apply feature
-   selection (e.g. recursive feature elimination) to find a subset that
-   retains any useful signal from the RESIDUALS/ANGLES groups without the
-   overfitting penalty seen across the board.
-
-6. **Ensemble / fusion of fingerprinting and trilateration.** The
-   room-level finding (KNN-5: 100% room accuracy vs. RF: 72.2%, finding 9)
-   suggests fingerprinting and trilateration may have complementary
-   failure modes; a fusion approach (e.g. using a fingerprint-derived room
-   estimate to constrain or initialize the trilateration search, or vice
-   versa) could improve both robustness and interpretability.
-
-7. **Investigate the G14-class corner/edge failure mode directly** — add
-   dedicated calibration points near building corners, or add a
-   "distance-to-nearest-calibration-point" feature to the RF correction
-   stage so the model can recognize and flag extrapolation regions
-   (G14: 31.51 m / 25.09 m / 17.10 m for A/B/C, even the oracle is poor).
+- Invert per-anchor path-loss models to estimate
+  anchor distances, then apply trilateration
+- Use IDW as a fallback where path-loss fits poorly
+- Validate across different buildings and anchor layouts
+- Apply light per-deployment calibration to adapt
+  path-loss exponents
 
 ---
 
@@ -1451,114 +754,70 @@ position and are not used anywhere in the current pipeline (§2).
 ## Appendix C: File Structure & Descriptions
 
 ```
-Mesurements/
-├── localize.py                      Fingerprinting pipeline (§4): grid-stratified
-│                                     7-fold CV over 6 classifiers (KNN-1/3/5,
-│                                     RandomForest, SVM-RBF, SVM-Linear) on
-│                                     26 grids × 32-dim features (PART 1), plus a
-│                                     room-level holdout evaluation over 5 rooms
-│                                     via ROOMS / TEST_GRIDS / GRID_TO_ROOM (PART 2, §4.4).
-├── records/grid1..28.pcapng         Raw IEEE 802.15.4 TAP captures, one per
-│                                     measurement grid. Only grid1..26 are consumed
-│                                     (N_GRIDS = 26); grid27/grid28 are unused.
-├── records.zip                      Archived copy of records/.
-├── accuracy_summary.png             Bar chart: mean ± std accuracy per classifier.
-├── per_fold_accuracy.png            Per-fold accuracy for each classifier.
-├── per_grid_accuracy.png            Per-grid accuracy for the best classifier (RF).
-├── feature_importance.png           RF anchor-importance bar chart (§4.3).
-├── cm_*.png                         Confusion matrices per classifier.
-├── Routers Map/                     Photos of the OpenThread dashboard / network
-│                                     configuration used during data collection (§2).
-└── rssi_interpolation/
-    ├── interpolate.py               Core module (§3, §5): pcapng/TAP/802.15.4
-    │                                 parsing, GRID_POSITIONS (26), ANCHOR_POSITIONS
-    │                                 == KNOWN_ANCHORS (8), IDW predict_rssi(),
-    │                                 LOO-CV evaluate(), HELD_OUT = [5, 15].
-    ├── held_out_validate.py         2-grid held-out IDW validation (§5.2).
-    ├── path_loss_model.py           Log-distance path-loss Models 1 & 2 (§6);
-    │                                 IDW_OVERALL_MAE = 3.87, IDW_PER_GRID =
-    │                                 {5: 5.59, 15: 2.15}.
-    ├── heatmap.py                   Per-anchor RSSI heatmaps via IDW (rssi_heatmaps.png).
-    ├── predict_cli.py               CLI: predict RSSI at an (x, y) query point (§5.3).
-    ├── transferability_test.py      v3 — RF on raw RSSI, "triangle coverage" split (§7.3).
-    ├── transferability_test_v1.py   v1 — first anchor+grid transfer split (5 vs 4 anchors).
-    ├── transferability_test_v2.py   v2 — geographically-balanced anchor split.
-    ├── transferability_test_v4.py   v4 — engineered features, RF/KNN/SVR comparison (§7.3).
-    ├── transferability_test_v5.py   v5 — WC1–WC5 weighted-centroid/trilateration/Ridge (§7.2).
-    ├── transferability_test_v7.py   v7 — WC4 + RF correction (uncertainty-
-    │                                 weighted), CORR_FEAT_DIM = 17 (best, §7.4).
-    ├── transferability_test_v8.py   v8 — geographic (left/right) split,
-    │                                 CORR_FEAT_DIM = 32 (§7.5).
-    ├── transferability_test_v9.py   v9 — balanced interleaved split, all 8 anchors,
-    │                                 FEAT_DIM = 22 rich features (§7.6).
-    ├── transferability_test_v10.py  v10 — v7 split + FEAT_DIM = 19 rich features,
-    │                                 feature-complexity study (§7.7).
-    ├── confidence_score.py          Per-prediction confidence scoring on v7-B,
-    │                                 5-component weighted formula (§7.8).
-    ├── run_confidence.py            Thin entry point for confidence_score.py.
-    ├── run_path_loss.py             Thin entry point for path_loss_model.py.
-    ├── run_transferability*.py      Thin entry points for each transferability_test_v*.py.
-    ├── validate.py                  Thin entry point for held_out_validate.py.
-    ├── transferability_*.png        Maps, error plots, calibration-impact and
-    │                                 feature-importance plots for each version.
-    ├── confidence_*.png             Confidence scatter/map/breakdown plots (§7.8).
-    ├── path_loss_*.png              Path-loss comparison and fit plots (§6).
-    ├── held_out_validation.png      Held-out validation plot (§5.2).
-    └── requirements.txt             numpy>=1.20, matplotlib>=3.3
+wifi-indoor-localization/
+├── data/
+│   └── records/grid1..28.pcapng    Raw IEEE 802.15.4 TAP captures, one per
+│                                    measurement grid. Only grid1..26 consumed
+│                                    (N_GRIDS = 26); grid27/28 exist but unused.
+├── src/
+│   ├── localize.py                  Fingerprinting pipeline (§4): grid-stratified
+│   │                                 7-fold CV over 6 classifiers (KNN-1/3/5,
+│   │                                 RandomForest, SVM-RBF, SVM-Linear) on 26 grids
+│   │                                 × 16-dim features (mean+std), plus room-level
+│   │                                 holdout evaluation (PART 2, §4.4).
+│   ├── ablation_study.py            Feature-subset ablation (§4.5): 5 stat combos
+│   │                                 (mean-only → mean+std+median+count).
+│   ├── interpolate.py               Core IDW module (§5): pcapng parsing,
+│   │                                 GRID_POSITIONS (26), ANCHOR_POSITIONS (8),
+│   │                                 predict_rssi(), LOO-CV evaluate().
+│   ├── heatmap.py                   Per-anchor RSSI heatmaps via IDW (§5.1).
+│   ├── predict_cli.py               CLI: predict RSSI at any (x, y) (§5.3).
+│   ├── held_out_validate.py         2-grid held-out IDW validation (§5.2).
+│   ├── validate.py                  Thin runner for held_out_validate.py.
+│   ├── path_loss_model.py           Log-distance path-loss Models 1 & 2 (§6).
+│   └── run_path_loss.py             Thin runner for path_loss_model.py.
+├── results/
+│   └── figures/                     Output PNGs from Chapters 1–6.
+├── reports/
+│   ├── final_report.md              Full project report (this document).
+│   ├── final_report_summary.md      Executive summary.
+│   ├── generate_html_report_v2.py   Builds final_report_complete.html.
+│   └── make_pdf.py                  Builds PDF reports via reportlab.
+├── requirements.txt                 numpy>=1.20, matplotlib>=3.3, scikit-learn, etc.
+├── .gitignore
+└── README.md
 ```
+
 
 ---
 
 ## Appendix D: Reproduction Commands
 
-All commands assume the working directory is `rssi_interpolation/`
-(except `localize.py`, which lives one level up and is run from
-`Mesurements/`).
+All commands run from the repo root (`wifi-indoor-localization/`).
 
 ```bash
-# Fingerprinting (§4): PART 1 (26-class CV) + PART 2 (room-level holdout)
-# — run from Mesurements/
-python localize.py
+# Fingerprinting — Ch 4: 26-class CV + room-level holdout
+python src/localize.py
 
-# RSSI interpolation: LOO-CV over all 26 grids (§5.1)
-python interpolate.py
+# RSSI interpolation — Ch 5: LOO-CV over all 26 grids
+python src/interpolate.py
 
-# Held-out grid validation: grids 5, 15 (§5.2)
-python held_out_validate.py
+# Held-out grid validation — Ch 5: grids 5, 15
+python src/held_out_validate.py
 # or:
-python validate.py
+python src/validate.py
 
-# Example RSSI prediction at a query point (§5.3)
-python predict_cli.py 12.5 4.0
+# Example RSSI prediction at a query point — Ch 5
+python src/predict_cli.py 12.5 4.0
 
-# Per-anchor RSSI heatmaps
-python heatmap.py
+# Per-anchor RSSI heatmaps — Ch 5
+python src/heatmap.py
 
-# Path-loss models 1 & 2 vs IDW, HELD_OUT=[5,15] (§6)
-python path_loss_model.py
+# Path-loss models 1 & 2 vs IDW — Ch 6
+python src/path_loss_model.py
 # or:
-python run_path_loss.py
+python src/run_path_loss.py
 
-# Baseline weighted-centroid comparison WC1-WC5 (§7.2)
-python transferability_test_v5.py
-
-# Learned baselines: v3 RF, v4 SVR (§7.3)
-python transferability_test.py
-python transferability_test_v4.py
-
-# Transferability v7 — best non-oracle result (§7.4)
-python run_transferability_v7.py
-
-# Transferability v8 — geographic split (§7.5)
-python run_transferability_v8.py
-
-# Transferability v9 — all anchors, rich features (§7.6)
-python run_transferability_v9.py
-
-# Transferability v10 — feature-complexity study (§7.7)
-python run_transferability_v10.py
-
-# Confidence scoring on v7-B (§7.8)
-python run_confidence.py
+# Feature-subset ablation study — Ch 4
+python src/ablation_study.py
 ```
-
