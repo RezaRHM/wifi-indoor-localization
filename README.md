@@ -7,7 +7,7 @@ IEEE 802.15.4 / Thread RSSI-based indoor localization — fingerprinting, IDW sp
 ```
 wifi-indoor-localization/
 ├── data/
-│   └── records/              # Raw pcapng captures — one file per grid position (G1–G28)
+│   └── records/              # Raw pcapng captures — one file per grid position (G1–G26 (active); G27–G28 present but unused by scripts)
 ├── src/
 │   ├── localize.py           # Ch 1–4  RSSI fingerprinting (KNN, RF, SVM), 7-fold CV, room holdout
 │   ├── ablation_study.py     # Ch 4    Feature-subset ablation (mean / std / median / count)
